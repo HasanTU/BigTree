@@ -1,0 +1,6 @@
+aws_region         = "ap-southeast-1"
+environment        = "dev"
+project_name       = "dubaimai"
+default_start_date = "2023-04-01"
+default_end_date   = "2023-04-30"
+# schedule_cron     = "cron(0 0 1 * ? *)" # Optional: run 1st day of every month

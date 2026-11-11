@@ -1,0 +1,28 @@
+[project]
+name = "bigtree"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Kanna-Sama89", email = "ToukaKannaSama@proton.me" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.44.0",
+    "pandas>=3.1.1",
+    "python-dotenv>=1.2.4",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+bigtree = "bigtree:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "responses>=0.26.3",
+]
