@@ -6,7 +6,6 @@ provider "aws" {
       Project   = "Dubaimai"
       Course    = "CS341"
       ManagedBy = "Terraform"
-      Role      = "Person1-Ingestion"
     }
   }
 }
@@ -71,12 +70,24 @@ resource "aws_s3_object" "folder_not_pass" {
   key    = "not_pass/"
 }
 
-# Seed initial coordinates CSV into spatial/ prefix
+resource "aws_s3_object" "folder_reports" {
+  bucket = aws_s3_bucket.dubaimai_lake.id
+  key    = "reports/"
+}
+
+# Seed 50 district coordinates and green space data into S3
 resource "aws_s3_object" "seed_coordinates" {
   bucket = aws_s3_bucket.dubaimai_lake.id
   key    = "spatial/district_coordinates.csv"
-  source = "${path.module}/../data/sample_district_coordinates.csv"
-  etag   = filemd5("${path.module}/../data/sample_district_coordinates.csv")
+  source = "${path.module}/../data/district_coordinates.csv"
+  etag   = filemd5("${path.module}/../data/district_coordinates.csv")
+}
+
+resource "aws_s3_object" "seed_green_space" {
+  bucket = aws_s3_bucket.dubaimai_lake.id
+  key    = "data/green_space.csv"
+  source = "${path.module}/../data/green_space.csv"
+  etag   = filemd5("${path.module}/../data/green_space.csv")
 }
 
 # -----------------------------------------------------------------------------
@@ -84,43 +95,15 @@ resource "aws_s3_object" "seed_coordinates" {
 # -----------------------------------------------------------------------------
 data "archive_file" "lambda_zip" {
   type        = "zip"
-  output_path = "${path.module}/dist/ingestion_lambda.zip"
-
-  source {
-    content  = file("${path.module}/../src/bigtree/__init__.py")
-    filename = "bigtree/__init__.py"
-  }
-  source {
-    content  = file("${path.module}/../src/bigtree/ingestion/__init__.py")
-    filename = "bigtree/ingestion/__init__.py"
-  }
-  source {
-    content  = file("${path.module}/../src/bigtree/ingestion/weather_client.py")
-    filename = "bigtree/ingestion/weather_client.py"
-  }
-  source {
-    content  = file("${path.module}/../src/bigtree/ingestion/weather_collector.py")
-    filename = "bigtree/ingestion/weather_collector.py"
-  }
-  source {
-    content  = file("${path.module}/../src/bigtree/ingestion/s3_uploader.py")
-    filename = "bigtree/ingestion/s3_uploader.py"
-  }
-  source {
-    content  = file("${path.module}/../src/bigtree/ingestion/handler.py")
-    filename = "bigtree/ingestion/handler.py"
-  }
-  source {
-    content  = file("${path.module}/../data/sample_district_coordinates.csv")
-    filename = "data/sample_district_coordinates.csv"
-  }
+  source_dir  = "${path.module}/../src"
+  output_path = "${path.module}/dist/pipeline_bundle.zip"
 }
 
 # -----------------------------------------------------------------------------
 # 3. IAM Least-Privilege Execution Role
 # -----------------------------------------------------------------------------
 resource "aws_iam_role" "lambda_role" {
-  name = "${var.project_name}-lambda-ingestion-role-${var.environment}"
+  name = "${var.project_name}-lambda-pipeline-role-${var.environment}"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -137,7 +120,7 @@ resource "aws_iam_role" "lambda_role" {
 }
 
 resource "aws_iam_role_policy" "lambda_policy" {
-  name = "${var.project_name}-lambda-ingestion-policy-${var.environment}"
+  name = "${var.project_name}-lambda-pipeline-policy-${var.environment}"
   role = aws_iam_role.lambda_role.id
 
   policy = jsonencode({
@@ -170,22 +153,22 @@ resource "aws_iam_role_policy" "lambda_policy" {
   })
 }
 
-# -----------------------------------------------------------------------------
-# 4. AWS Lambda Ingestion Function
-# -----------------------------------------------------------------------------
-# AWS Managed Pandas / Requests Layer for Python 3.12 in ap-southeast-1
-# Official ARN provided by AWS SDK for pandas (AWS Data Wrangler)
 locals {
   pandas_layer_arn = "arn:aws:lambda:${var.aws_region}:336392948345:layer:AWSSDKPandas-Python312:12"
 }
 
+# -----------------------------------------------------------------------------
+# 4. AWS Lambda Pipeline Functions
+# -----------------------------------------------------------------------------
+
+# Step 1: Ingestion Lambda (Person 1)
 resource "aws_lambda_function" "weather_ingestion" {
   function_name    = "${var.project_name}-weather-ingestion-${var.environment}"
   role             = aws_iam_role.lambda_role.arn
   handler          = "bigtree.ingestion.handler.lambda_handler"
   runtime          = "python3.12"
   memory_size      = 256
-  timeout          = 180 # 3 minutes covers 50 API calls safely with retries
+  timeout          = 180
   filename         = data.archive_file.lambda_zip.output_path
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
 
@@ -200,33 +183,49 @@ resource "aws_lambda_function" "weather_ingestion" {
     }
   }
 
-  depends_on = [
-    aws_iam_role_policy.lambda_policy,
-  ]
+  depends_on = [aws_iam_role_policy.lambda_policy]
 }
 
-# -----------------------------------------------------------------------------
-# 5. Optional EventBridge Cron Trigger
-# -----------------------------------------------------------------------------
-resource "aws_cloudwatch_event_rule" "schedule" {
-  count               = var.schedule_cron != "" ? 1 : 0
-  name                = "${var.project_name}-weather-cron-${var.environment}"
-  description         = "Periodic trigger for Dubaimai weather ingestion"
-  schedule_expression = var.schedule_cron
+# Step 2: Transformation & Quality Validation Lambda (Person 3)
+resource "aws_lambda_function" "data_transformation" {
+  function_name    = "${var.project_name}-data-transformation-${var.environment}"
+  role             = aws_iam_role.lambda_role.arn
+  handler          = "bigtree.entrypoints.lambda_transform.lambda_handler"
+  runtime          = "python3.12"
+  memory_size      = 512
+  timeout          = 120
+  filename         = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+
+  layers = [local.pandas_layer_arn]
+
+  environment {
+    variables = {
+      S3_BUCKET_NAME = aws_s3_bucket.dubaimai_lake.id
+    }
+  }
+
+  depends_on = [aws_iam_role_policy.lambda_policy]
 }
 
-resource "aws_cloudwatch_event_target" "lambda_target" {
-  count     = var.schedule_cron != "" ? 1 : 0
-  rule      = aws_cloudwatch_event_rule.schedule[0].name
-  target_id = "IngestionLambdaTarget"
-  arn       = aws_lambda_function.weather_ingestion.arn
-}
+# Step 3: Statistical Research Analysis Lambda (Person 4)
+resource "aws_lambda_function" "research_analysis" {
+  function_name    = "${var.project_name}-research-analysis-${var.environment}"
+  role             = aws_iam_role.lambda_role.arn
+  handler          = "bigtree.entrypoints.lambda_analyze.lambda_handler"
+  runtime          = "python3.12"
+  memory_size      = 512
+  timeout          = 120
+  filename         = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
 
-resource "aws_lambda_permission" "allow_eventbridge" {
-  count         = var.schedule_cron != "" ? 1 : 0
-  statement_id  = "AllowExecutionFromEventBridge"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.weather_ingestion.function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.schedule[0].arn
+  layers = [local.pandas_layer_arn]
+
+  environment {
+    variables = {
+      S3_BUCKET_NAME = aws_s3_bucket.dubaimai_lake.id
+    }
+  }
+
+  depends_on = [aws_iam_role_policy.lambda_policy]
 }
